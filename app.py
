@@ -1,0 +1,120 @@
+import os
+from pathlib import Path
+import streamlit as st
+import google.generativeai as genai
+from dotenv import load_dotenv
+from pypdf import PdfReader
+
+# 1. API Key కాన్ఫిగరేషన్ (Local .env లేదా Streamlit Secrets)
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+
+if not api_key:
+    st.error("దయచేసి GEMINI_API_KEY ని సెట్ చేయండి (.env లేదా Streamlit Secrets లో).")
+    st.stop()
+
+genai.configure(api_key=api_key)
+
+# 2. పేజీ లేఅవుట్ సెటప్
+st.set_page_config(page_title="ASROPedia Notebook", page_icon="📚", layout="wide")
+st.title("📚 ASROPedia - Source Grounded Assistant")
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+# 3. డాక్యుమెంట్ల టెక్స్ట్ రీడ్ చేసే ఫంక్షన్
+def load_sources():
+    sources = {}
+    for file_path in DATA_DIR.glob("*"):
+        if file_path.suffix.lower() in [".txt", ".md"]:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    sources[file_path.name] = f.read()
+            except Exception as e:
+                st.warning(f"{file_path.name} చదవడంలో లోపం: {e}")
+        elif file_path.suffix.lower() == ".pdf":
+            try:
+                reader = PdfReader(file_path)
+                text = "\n".join([page.extract_text() or "" for page in reader.pages])
+                sources[file_path.name] = text
+            except Exception as e:
+                st.warning(f"PDF {file_path.name} ప్రాసెస్ చేయడంలో లోపం: {e}")
+    return sources
+
+# 4. సైడ్‌బార్: డాక్యుమెంట్ల అప్‌లోడ్ & నిర్వహణ
+with st.sidebar:
+    st.header("📂 ఆధార పత్రాలు (Sources)")
+    uploaded_files = st.file_uploader(
+        "ఫైల్స్ అప్‌లోడ్ చేయండి (PDF, TXT, MD)", 
+        type=["pdf", "txt", "md"], 
+        accept_multiple_files=True
+    )
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            save_path = DATA_DIR / uploaded_file.name
+            with open(save_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+        st.success("ఫైల్స్ విజయవంతంగా సేవ్ అయ్యాయి!")
+
+    sources_data = load_sources()
+    if sources_data:
+        st.subheader("అందుబాటులో ఉన్న సోర్స్‌లు:")
+        for name in sources_data.keys():
+            st.markdown(f"- 📄 `{name}`")
+    else:
+        st.info("ప్రస్తుతం ఫైల్స్ ఏవీ లేవు. పైనుండి అప్‌లోడ్ చేయండి.")
+
+# 5. చాట్ మెసేజ్‌ల హిస్టరీ
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 6. యూజర్ ప్రశ్నను విశ్లేషించి సమాధానం ఇవ్వడం
+if user_query := st.chat_input("మీ డాక్యుమెంట్ల నుండి ఏదైనా ప్రశ్న అడగండి..."):
+    st.session_state.messages.append({"role": "user", "content": user_query})
+    with st.chat_message("user"):
+        st.markdown(user_query)
+
+    if not sources_data:
+        reply = "సమాధానం ఇవ్వడానికి డాక్యుమెంట్లు లేవు. దయచేసి సైడ్‌బార్ ద్వారా ఫైల్స్ అప్‌లోడ్ చేయండి."
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+    else:
+        context_blocks = []
+        for name, content in sources_data.items():
+            context_blocks.append(f"--- SOURCE START: {name} ---\n{content}\n--- SOURCE END: {name} ---")
+        
+        full_context = "\n\n".join(context_blocks)
+
+        prompt = f"""
+You are ASROPedia, an authentic, strictly source-grounded assistant.
+Answer the user's question ONLY using the provided source context below.
+If the answer cannot be found in the sources, clearly state in Telugu that the provided sources do not contain this information. 
+Do NOT extrapolate or hallucinate.
+Always cite the exact source document name when providing factual points.
+
+SOURCE CONTEXT:
+{full_context}
+
+USER QUESTION:
+{user_query}
+"""
+
+        with st.chat_message("assistant"):
+            with st.spinner("సమాధానం వెతుకుతోంది..."):
+                try:
+                    model = genai.GenerativeModel("gemini-1.5-flash")
+                    response = model.generate_content(prompt)
+                    answer = response.text
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                except Exception as ex:
+                    st.error(f"ఎర్రర్ సంభవించింది: {ex}")
